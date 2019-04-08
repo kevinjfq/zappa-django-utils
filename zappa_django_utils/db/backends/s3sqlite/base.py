@@ -7,6 +7,7 @@ import botocore
 import hashlib
 import logging
 import os
+import tempfile
 
 
 class DatabaseWrapper(DatabaseWrapper):
@@ -26,51 +27,58 @@ class DatabaseWrapper(DatabaseWrapper):
             config=botocore.client.Config(signature_version=signature_version),
         )
 
-        if '/tmp/' not in self.settings_dict['NAME']:
-            try:
+        self.settings_dict['REMOTE_NAME'] = os.path.basename( self.settings_dict['NAME'] )
+        if os.path.isfile(self.settings_dict['NAME']):
+            self.settings_dict['LOCAL_NAME'] = self.settings_dict['NAME']
+        else:
+            self.settings_dict['LOCAL_NAME'] = os.path.join( tempfile.gettempdir(), self.settings_dict['NAME'] )
+
+        try:
+            # Get an ETag/md5 for the local DB file.
+            # Make sure the local DB file exists. (If it doesn't yet, next we will copy from the remote DB file.)
+            if not os.path.isfile( self.settings_dict['LOCAL_NAME'] ):
                 etag = ''
-                if os.path.isfile('/tmp/' + self.settings_dict['NAME']):
-                    m = hashlib.md5()
-                    with open('/tmp/' + self.settings_dict['NAME'], 'rb') as f:
-                        m.update(f.read())
-
-                    # In general the ETag is the md5 of the file, in some cases it's not,
-                    # and in that case we will just need to reload the file, I don't see any other way
-                    etag = m.hexdigest()
-
-                obj = s3.Object(self.settings_dict['BUCKET'], self.settings_dict['NAME'])
-                obj_bytes = obj.get(IfNoneMatch=etag)["Body"]  # Will throw E on 304 or 404
-
-                with open('/tmp/' + self.settings_dict['NAME'], 'wb') as f:
-                    f.write(obj_bytes.read())
-
+                open(self.settings_dict['LOCAL_NAME'], 'a').close()
+            else:
                 m = hashlib.md5()
-                with open('/tmp/' + self.settings_dict['NAME'], 'rb') as f:
+                with open( self.settings_dict['LOCAL_NAME'] , 'rb') as f:
                     m.update(f.read())
+                # In general the ETag is the md5 of the file, in some cases it's not,
+                # and in that case we will just need to reload the file, I don't see any other way
+                etag = m.hexdigest()
+        except Exception as e:
+            # Weird one
+            logging.debug(f"Couldn't access the local DB file: {self.settings_dict['LOCAL_NAME']}" )
+            logging.debug(e)
 
-                self.db_hash = m.hexdigest()
+        # Copy the remote DB file unless its ETag matches md5 of local copy.
+        try:
+            obj = s3.Object(self.settings_dict['BUCKET'], self.settings_dict['REMOTE_NAME'])
+            obj_bytes = obj.get(IfNoneMatch=etag)["Body"]  # Will throw E on 304 or 404
 
-            except botocore.exceptions.ClientError as e:
-                if e.response['Error']['Code'] == "304":
-                    logging.debug("ETag matches md5 of local copy, using local copy of DB!")
-                    self.db_hash = etag
-                else:
-                    logging.debug("Couldn't load remote DB object.")
-            except Exception as e:
-                # Weird one
-                logging.debug(e)
+            with open( self.settings_dict['LOCAL_NAME'] , 'wb') as f:
+                f.write(obj_bytes.read())
+
+            m = hashlib.md5()
+            with open( self.settings_dict['LOCAL_NAME'] , 'rb') as f:
+                m.update(f.read())
+
+            self.db_hash = m.hexdigest()
+            logging.debug(f"Loaded remote DB to local DB file. From BUCKET={self.settings_dict['BUCKET']}, REMOTE_NAME={self.settings_dict['REMOTE_NAME']}" )
+
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == "304":
+                logging.debug("ETag matches md5 of local copy, using local copy of DB!")
+                self.db_hash = etag
+            else:
+                logging.debug("Couldn't load remote DB object.")
+                logging.debug(f"Couldn't load remote DB object. From BUCKET={self.settings_dict['BUCKET']}, REMOTE_NAME={self.settings_dict['REMOTE_NAME']}" )
+        except Exception as e:
+            # Weird one
+            logging.debug(e)
 
         # SQLite DatabaseWrapper will treat our tmp as normal now
         # Check because Django likes to call this function a lot more than it should
-        if '/tmp/' not in self.settings_dict['NAME']:
-            self.settings_dict['REMOTE_NAME'] = self.settings_dict['NAME']
-            self.settings_dict['NAME'] = '/tmp/' + self.settings_dict['NAME']
-
-        # Make sure it exists if it doesn't yet
-        if not os.path.isfile(self.settings_dict['NAME']):
-            open(self.settings_dict['NAME'], 'a').close()
-
-        logging.debug("Loaded remote DB!")
 
     def __init__(self, *args, **kwargs):
         super(DatabaseWrapper, self).__init__(*args, **kwargs)
